@@ -1,0 +1,120 @@
+stages:
+  - validate
+  - plan
+  - apply
+
+# ---------------------------------------------------------------
+# Общие настройки для всех Terraform-джобов
+# ---------------------------------------------------------------
+# Переменные CI/CD, которые нужно задать в GitLab → Settings → CI/CD → Variables:
+#
+#   YC_TOKEN              — IAM-токен или OAuth-токен Yandex Cloud (masked, protected)
+#   YC_CLOUD_ID           — ID облака
+#   YC_FOLDER_ID          — ID каталога
+#   AWS_ACCESS_KEY_ID     — логин MinIO (masked)
+#   AWS_SECRET_ACCESS_KEY — пароль MinIO (masked)
+#   MINIO_ENDPOINT        — URL MinIO API, например http://localhost:9000
+#   TF_VAR_ssh_pub_key_path — путь к SSH-ключу на Runner'е
+# ---------------------------------------------------------------
+
+variables:
+  TF_IN_AUTOMATION: "true"
+
+.terraform_base:
+  tags:
+    - shell                 # Runner на хосте (shell executor)
+  before_script:
+    - terraform version
+    - export TF_VAR_ssh_pub_key_path="${TF_VAR_ssh_pub_key_path}"
+
+# ---------------------------------------------------------------
+# Validate — проверка синтаксиса (один раз для всего кода)
+# ---------------------------------------------------------------
+validate:
+  stage: validate
+  extends: .terraform_base
+  script:
+    - terraform fmt -check -recursive
+    - >
+      terraform init -backend=false
+    - terraform validate
+
+# ---------------------------------------------------------------
+# Plan — для каждого окружения
+# ---------------------------------------------------------------
+.plan_template:
+  stage: plan
+  extends: .terraform_base
+  script:
+    - >
+      terraform init -reconfigure
+      -backend-config=./envs/${ENV}/${ENV}.tfbackend
+      -backend-config="endpoints={s3=\"${MINIO_ENDPOINT}\"}"
+    - >
+      terraform plan
+      -var-file=./envs/${ENV}/terraform.tfvars
+      -out=plan_${ENV}.tfplan
+  artifacts:
+    paths:
+      - plan_${ENV}.tfplan
+      # Сохраняем инициализированный backend для apply
+      - .terraform
+      - .terraform.lock.hcl
+    expire_in: 1 hour
+
+plan:dev:
+  extends: .plan_template
+  variables:
+    ENV: dev
+
+plan:stage:
+  extends: .plan_template
+  variables:
+    ENV: stage
+
+plan:prod:
+  extends: .plan_template
+  variables:
+    ENV: prod
+
+# ---------------------------------------------------------------
+# Apply — только вручную (when: manual)
+# ---------------------------------------------------------------
+.apply_template:
+  stage: apply
+  extends: .terraform_base
+  script:
+    - >
+      terraform init -reconfigure
+      -backend-config=./envs/${ENV}/${ENV}.tfbackend
+      -backend-config="endpoints={s3=\"${MINIO_ENDPOINT}\"}"
+    - terraform apply plan_${ENV}.tfplan
+  when: manual
+  allow_failure: false
+
+apply:dev:
+  extends: .apply_template
+  variables:
+    ENV: dev
+  needs:
+    - plan:dev
+  environment:
+    name: dev
+
+apply:stage:
+  extends: .apply_template
+  variables:
+    ENV: stage
+  needs:
+    - plan:stage
+  environment:
+    name: stage
+
+apply:prod:
+  extends: .apply_template
+  variables:
+    ENV: prod
+  needs:
+    - plan:prod
+  environment:
+    name: prod
